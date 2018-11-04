@@ -18,7 +18,9 @@
 #include "nRF24L01.h"
 #include "RF24.h"
 #include "printf.h"
-#include <EEPROM.h>
+#include "eeprom_common.h"
+
+#define NUM_OF_PIPES  6
 
 // Hardware configuration: Set up nRF24L01 radio on SPI bus plus pins 7 & 8 
 RF24 radio(9,10);
@@ -27,9 +29,8 @@ RF24 radio(9,10);
 const uint64_t pipes[2] = { 0xB3B4B5B6F1LL, 0xDEADBEEFFFLL };              // Radio pipe addresses for the 2 nodes to communicate.
 
 // A single byte to keep track of the data being sent back and forth
-byte counter = 1;
 
-#define PAYLOAD_SIZE (32)
+#define PAYLOAD_SIZE (16)
 
 struct PayloadData {
   unsigned long ulTimeStamp;
@@ -46,14 +47,14 @@ union PayloadRaw {
 #define PL_TimeStamp stPData.ulTimeStamp 
 #define PL_Counter stPData.ulCounter 
 
-union PayloadRaw uiTxBuf, uiRxBuf;
+union PayloadRaw uiTxBuf, uiRxBuf[NUM_OF_PIPES];
+unsigned char ucRxBufFlag[NUM_OF_PIPES];
+unsigned char ucWriteAckFlag;
 
-#define EEPROM_BUTTON_PIN (5)
+extern union EEPROM_AddrDataRaw uiEEPROMAddrData;
 
 void setup()
 {
-  int i;
-  unsigned long long ullData;
 
   Serial.begin(115200);
   printf_begin();
@@ -65,22 +66,19 @@ void setup()
     while(1);
   }
 
-  while(1) {
-    ullData = EEPROM_InputAddrData();
-    if( ullData ) 
-      printf("%7lu) ## NK [%s:%d] 0x%08lx%08lx\n", millis(), __func__, __LINE__, (unsigned long)(ullData >> 32), (unsigned long)(ullData & 0x00000000FFFFFFFF));
-  }
-
-  printf("EEPROM.length() : %d\n", EEPROM.length());
   printf("unsigned long long : %d\n", sizeof(unsigned long long));
-  printf("uint64_t : %d\n", sizeof(uint64_t));
-  printf("unsigned long : %d\n", sizeof(unsigned long));
+  printf("uint64_t           : %d\n", sizeof(uint64_t));
+  printf("unsigned long      : %d\n", sizeof(unsigned long));
+  printf("unsigned int       : %d\n", sizeof(unsigned int));
 
   pinMode(EEPROM_BUTTON_PIN, INPUT);
   
   if( digitalRead(EEPROM_BUTTON_PIN) ) {
     printf("EEPROM Button Pressed !!\n");
     printf("Initialize EEPROM and write the address !!\n");
+
+    EEPROM_UpdateAddrData();
+    
     EEPROM_WriteAddrData();
     printf("Done !! Recycle the power !!\n");
     while(1);
@@ -95,20 +93,21 @@ void setup()
   radio.begin();
   radio.setAutoAck(1);                    // Ensure autoACK is enabled
   radio.enableAckPayload();               // Allow optional ack payloads
-  radio.setRetries(1,15);                 // Smallest time between retries, max no. of retries, NK - it's a key when payload size is bigger than 1
+  radio.setRetries(7,15);                 // Smallest time between retries, max no. of retries, NK - it's a key when payload size is bigger than 1
   radio.setPayloadSize(PAYLOAD_SIZE);     // Here we are sending 1-byte payloads to test the call-response speed
-  radio.setDataRate(RF24_1MBPS);          // Set air data rate to 1 Mbps (Default)
-  radio.setChannel(0x4C);                 // Set channel to 0x4C(76) - 2476 Hz
+  radio.setDataRate(RF24_250KBPS);          // Set air data rate to 1 Mbps (Default)
+  radio.setChannel(uiEEPROMAddrData.AD_RFCh);                 // Set channel to 0x4C(76) - 2476 Hz
+  radio.setPALevel(3);                    // Set PA Level (0 ~ 3)
 
   // Below two lines are not necessary for RX but better to set with any specific address than reset default address
-  radio.openWritingPipe(pipes[1]);        // Both radios listen on the same pipes by default, and switch when writing, Not necessary for RX
-  radio.openReadingPipe(0,pipes[1]);      // Not necessary for RX
+  radio.openWritingPipe(uiEEPROMAddrData.AD_AnyAddr);        // Both radios listen on the same pipes by default, and switch when writing, Not necessary for RX
+  radio.openReadingPipe(0,uiEEPROMAddrData.AD_AnyAddr);      // Not necessary for RX
   
-  radio.openReadingPipe(1,pipes[0]);
-  radio.openReadingPipe(2,0xCDLL);
-  radio.openReadingPipe(3,0xA3LL);
-  radio.openReadingPipe(4,0x0FLL);
-  radio.openReadingPipe(5,0x05LL);
+  radio.openReadingPipe(1,uiEEPROMAddrData.AD_RxAddr);
+  radio.openReadingPipe(2,0xCDLL);  // 0xB3B4B5B6CDLL
+  radio.openReadingPipe(3,0xA3LL);  // 0xB3B4B5B6A3LL
+  radio.openReadingPipe(4,0x0FLL);  // 0xB3B4B5B60FLL
+  radio.openReadingPipe(5,0x05LL);  // 0xB3B4B5B605LL
 
   radio.enableDynamicPayloads();
 //  radio.disableDynamicPayloads();
@@ -118,14 +117,43 @@ void setup()
   radio.printDetails();                   // Dump the configuration of the rf unit for debugging
 }
 
-void loop(void) {
+int i;
 
+void loop(void) {
+  
   byte pipeNo;
   byte gotByte;                                       // Dump the payloads until we've gotten everything
-  
-  while( radio.available(&pipeNo)){
-    radio.read( uiRxBuf.cCh, PAYLOAD_SIZE );
-    radio.writeAckPayload(pipeNo,uiRxBuf.cCh, PAYLOAD_SIZE );
-    printf("%7lu) ## NK [%s:%d] Pipe:%d, Pkt TimeStamp : %lu, Counter : %lu\n", millis(), __func__, __LINE__, pipeNo, uiRxBuf.PL_TimeStamp, uiRxBuf.PL_Counter);
- }
+#if 0
+  while( radio.available(&pipeNo) ){
+    memset(uiRxBuf[0].cCh, 0, PAYLOAD_SIZE);
+    radio.read( uiRxBuf[0].cCh, PAYLOAD_SIZE );
+//    memcpy(uiTxBuf.cCh, uiRxBuf.cCh, sizeof(union PayloadRaw));
+    radio.writeAckPayload(pipeNo, uiRxBuf[0].cCh, PAYLOAD_SIZE );
+//    printf("%7lu) ## NK [%s:%d] Pipe:%d, Pkt TimeStamp : %lu, Counter : %lu\n", millis(), __func__, __LINE__, pipeNo, uiRxBuf.PL_TimeStamp, uiRxBuf[0].PL_Counter);
+//    delay(10);  // very necessary ? why ?
+  }
+#else
+  for( i = 0; i < NUM_OF_PIPES; i++) {
+    ucRxBufFlag[i] = 0;
+  }
+  ucWriteAckFlag = 0;
+  while( radio.available(&pipeNo) ){
+    if( pipeNo >= 0 && pipeNo < NUM_OF_PIPES ) {
+      radio.read( uiRxBuf[pipeNo].cCh, PAYLOAD_SIZE );
+      ucRxBufFlag[pipeNo] = 1;
+      ucWriteAckFlag = 1;
+    }
+  }
+
+  if( ucWriteAckFlag ) {
+    for( i = 0; i < NUM_OF_PIPES; i++) {
+      if( ucRxBufFlag[i] ) 
+        radio.writeAckPayload(i, uiRxBuf[i].cCh, PAYLOAD_SIZE );
+//    printf("%7lu) ## NK [%s:%d] Pipe:%d, Pkt TimeStamp : %lu, Counter : %lu\n", millis(), __func__, __LINE__, pipeNo, uiRxBuf.PL_TimeStamp, uiRxBuf.PL_Counter);
+//    delay(10);  // very necessary ? why ?
+    }
+  }
+
+
+#endif
 }
